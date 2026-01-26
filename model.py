@@ -1,388 +1,574 @@
-"""
-Urban Sound Classification - Optimized Solution
-Structure:
-1. Config & Setup
-2. Dataset & Preprocessing
-3. Model Architecture
-4. Training Loop (with Scheduler)
-5. Inference & Submission
-"""
-
 import os
+import gc
 import random
+import time
+import shutil  # ✅ 新增：用于复制文件
 import numpy as np
 import pandas as pd
-import librosa
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
-from sklearn.metrics import f1_score, accuracy_score
-from tqdm import tqdm
+from sklearn.metrics import accuracy_score
+from tqdm.notebook import tqdm
 
 # ==========================================
-# 1. 配置与全局设置 (Configuration)
+# 0. 基础设置
 # ==========================================
-BASE_DIR = Path("C://Users//zhuya//Desktop//Kaggle_Data")  # <--- 【注意】请修改这里为你的实际路径
-TRAIN_CSV = BASE_DIR / "metadata" / "kaggle_train.csv"
-TEST_CSV = BASE_DIR / "metadata" / "kaggle_test.csv"
-AUDIO_DIR = BASE_DIR / "audio"
+# ✅ 你的外部权重所在目录 (请确保 Kaggle Dataset 名字正确)
+EXTERNAL_WEIGHTS_DIR = Path('/kaggle/input/final-pseudo')
 
+BASE_DIR = Path('/kaggle/input/kaggle-data/Kaggle_Data')
+TRAIN_CSV_PATH = Path('/kaggle/input/new-csv/train_pseudo_r3.csv')
+TEST_CSV_PATH = BASE_DIR / "metadata" / "kaggle_test.csv"
+NPY_DIR = Path('/kaggle/input/processed')
+
+SAVE_DIR = Path('/kaggle/working/models')
+SAVE_DIR.mkdir(parents=True, exist_ok=True)
+
+# ==========================================
+# 1. 策略配置
+# ==========================================
 CONFIG = {
-    "SR": 22050,
-    "N_MELS": 128,
-    "DURATION": 4.0,       # 统一时长 4s
-    "MAX_LEN": 173,        # 128x173 的图像尺寸
-    "BATCH_SIZE": 32,
-    "EPOCHS": 25,          # 稍微增加 Epoch
-    "LR": 0.001,
-    "SEED": 42,            # 随机种子
-    "DEVICE": "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+    "MODELS": ["CRNN"],
+    "BASE_RES": 128,
+    # ✅ 覆盖所有分辨率，程序会自动去 input 找权重
+    "FINAL_RESOLUTIONS": [128, 160, 192, 256, 320],
+    "BATCH_SIZE": 64,
+    "EPOCHS": 55,
+    "PATIENCE": 12,
+    "LR": 1e-3,
+    "MIN_LR": 1e-6,
+    "SEED": 2024,
+    "DEVICE": "cuda" if torch.cuda.is_available() else "cpu",
+    "TTA_SHIFTS": [0, -4, 4],
+    "USE_CUTMIX": True,
+    "CUTMIX_PROB": 0.4,
+    "MIXUP_PROB": 0.3,
+    "NOISE_LEVEL": 0.015,
+    "NUM_WORKERS": 2,
 }
 
+# ==========================================
+# 2. Dataset
+# ==========================================
+class UrbanSoundDataset(Dataset):
+    def __init__(self, df, data_dir, mode='train', target_mels=128, cache_data=True):
+        self.df = df
+        self.mode = mode
+        self.target_mels = target_mels
+        self.file_paths = []
+        self.labels = []
+        self.filenames = []
+        
+        for idx, row in df.iterrows():
+            fname = str(row['slice_file_name'])
+            npy_name = fname.replace('.wav', '.npy')
+            self.filenames.append(fname)
+            
+            if mode == 'train':
+                if 'fold' in row and row['fold'] != -1:
+                    folder = f"fold{row['fold']}"
+                else:
+                    folder = "test"
+                
+                p = data_dir / folder / npy_name
+                if not p.exists():
+                    p = data_dir / "test" / npy_name
+                self.file_paths.append(p)
+                self.labels.append(row['classID'])
+            else:
+                self.file_paths.append(data_dir / "test" / npy_name)
+
+        self.cache_data = cache_data
+        self.data_cache = [None] * len(self.file_paths)
+        
+        if self.cache_data:
+            # 这里的 tqdm 可以关掉 leave=False 以保持清爽
+            print(f"    ⚡ Pre-loading {len(self.file_paths)} files...")
+            for i, path in enumerate(tqdm(self.file_paths, desc="Loading RAM", leave=False)):
+                try:
+                    self.data_cache[i] = np.load(path).astype(np.float32)
+                except:
+                    self.data_cache[i] = np.zeros((128, 173), dtype=np.float32)
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        if self.cache_data and self.data_cache[idx] is not None:
+            mel = self.data_cache[idx]
+        else:
+            try:
+                mel = np.load(self.file_paths[idx]).astype(np.float32)
+            except:
+                mel = np.zeros((128, 173), dtype=np.float32)
+
+        delta = mel.max() - mel.min() + 1e-8
+        img = (mel - mel.min()) / delta
+        img_tensor = torch.tensor(img).unsqueeze(0)
+        
+        if self.target_mels != img_tensor.shape[1]:
+            img_tensor = F.interpolate(
+                img_tensor.unsqueeze(0),
+                size=(self.target_mels, 173),
+                mode='bilinear', align_corners=False
+            ).squeeze(0)
+
+        if self.mode == 'train':
+            return img_tensor, torch.tensor(self.labels[idx], dtype=torch.long)
+        return img_tensor, idx, self.filenames[idx]
+
+# ==========================================
+# 3. Augmenter
+# ==========================================
+class Augmenter:
+    @staticmethod
+    def get_batch(imgs, lbls):
+        r = random.random()
+        if CONFIG["USE_CUTMIX"] and r < CONFIG["CUTMIX_PROB"]:
+            return Augmenter.cutmix(imgs, lbls)
+        elif r < CONFIG["CUTMIX_PROB"] + CONFIG["MIXUP_PROB"]:
+            return Augmenter.mixup(imgs, lbls)
+        return imgs, lbls, lbls, 1.0
+
+    @staticmethod
+    def add_noise(img):
+        if random.random() < 0.5: return img
+        return img + torch.randn_like(img) * CONFIG["NOISE_LEVEL"]
+
+    @staticmethod
+    def mixup(x, y, alpha=0.4):
+        lam = np.random.beta(alpha, alpha) if alpha > 0 else 1
+        idx = torch.randperm(x.size(0)).to(x.device)
+        return lam * x + (1 - lam) * x[idx, :], y, y[idx], lam
+
+    @staticmethod
+    def cutmix(x, y, alpha=1.0):
+        lam = np.random.beta(alpha, alpha) if alpha > 0 else 1
+        idx = torch.randperm(x.size(0)).to(x.device)
+        W, H = x.size(3), x.size(2)
+        cut_rat = np.sqrt(1. - lam)
+        cut_w, cut_h = int(W * cut_rat), int(H * cut_rat)
+        cx, cy = np.random.randint(W), np.random.randint(H)
+        bbx1 = np.clip(cx - cut_w // 2, 0, W)
+        bby1 = np.clip(cy - cut_h // 2, 0, H)
+        bbx2 = np.clip(cx + cut_w // 2, 0, W)
+        bby2 = np.clip(cy + cut_h // 2, 0, H)
+        x[:, :, bbx1:bbx2, bby1:bby2] = x[idx, :, bbx1:bbx2, bby1:bby2]
+        return x, y, y[idx], 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (x.size(2) * x.size(3)))
+
+    @staticmethod
+    def spec_augment(spec_img):
+        if random.random() > 0.5: return spec_img
+        augmented = spec_img.clone()
+        f_len = random.randint(0, int(augmented.shape[2]*0.15))
+        f0 = random.randint(0, augmented.shape[2] - f_len)
+        augmented[:, :, f0:f0+f_len, :] = 0.0
+        time_dim = augmented.shape[3]
+        t_len = random.randint(0, int(time_dim * 0.15))
+        t0 = random.randint(0, time_dim - t_len)
+        augmented[:, :, :, t0:t0+t_len] = 0.0
+        return augmented
+
+# ==========================================
+# 4. Model
+# ==========================================
+class SEBlock(nn.Module):
+    def __init__(self, c, r=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(c, c//r, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(c//r, c, bias=False),
+            nn.Sigmoid()
+        )
+    def forward(self, x):
+        return x * self.fc(self.avg_pool(x).view(x.shape[0], x.shape[1])).view(x.shape[0], x.shape[1], 1, 1)
+
+class ResBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, stride=1):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_ch)
+        self.conv2 = nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_ch)
+        self.se = SEBlock(out_ch)
+        self.sc = nn.Sequential()
+        if stride != 1 or in_ch != out_ch:
+            self.sc = nn.Sequential(nn.Conv2d(in_ch, out_ch, 1, stride=stride, bias=False), nn.BatchNorm2d(out_ch))
+    def forward(self, x):
+        return F.relu(self.se(self.bn2(self.conv2(F.relu(self.bn1(self.conv1(x)))))) + self.sc(x))
+
+class AdvancedCRNN(nn.Module):
+    def __init__(self, num_classes=10, input_mels=128):
+        super().__init__()
+        self.stem = nn.Sequential(nn.Conv2d(1, 64, 3, padding=1, bias=False), nn.BatchNorm2d(64), nn.ReLU(), nn.MaxPool2d(2))
+        self.l1 = nn.Sequential(ResBlock(64, 64), nn.MaxPool2d(2))
+        self.l2 = nn.Sequential(ResBlock(64, 128), nn.MaxPool2d(2))
+        self.l3 = nn.Sequential(ResBlock(128, 256), nn.MaxPool2d((2,1)))
+        self.l4 = nn.Sequential(ResBlock(256, 512), nn.MaxPool2d((2,1)))
+        self.gru = nn.GRU(512, 256, batch_first=True, bidirectional=True, dropout=0.2, num_layers=2)
+        self.attn = nn.Linear(512, 1)
+        self.dropout = nn.Dropout(0.3)
+        self.fc = nn.Linear(512, num_classes)
+        
+    def forward(self, x):
+        x = self.l4(self.l3(self.l2(self.l1(self.stem(x)))))
+        x = x.mean(dim=2).permute(0, 2, 1)
+        x, _ = self.gru(x)
+        w = F.softmax(self.attn(x), dim=1)
+        x = (x * w).sum(dim=1)
+        x = self.dropout(x)
+        return self.fc(x)
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=1, gamma=2, reduction='mean', label_smoothing=0.0):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        self.label_smoothing = label_smoothing
+
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none', label_smoothing=self.label_smoothing)
+        pt = torch.exp(-ce_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * ce_loss
+        if self.reduction == 'mean': return focal_loss.mean()
+        return focal_loss.sum()
+
 def seed_everything(seed):
-    """固定随机种子，保证结果可复现"""
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.benchmark = True
 
 # ==========================================
-# 2. 数据处理与加载 (Dataset)
+# 5. 训练函数 (✅ 关键修改版)
 # ==========================================
-# ==========================================
-# 新增: SpecAugment 函数
-# ==========================================
-def spec_augment(spec_img, num_mask=2, freq_masking=15, time_masking=30):
-    """
-    spec_img: Tensor (1, n_mels, time_steps)
-    """
-    augmented_spec = spec_img.clone()
-    _, n_mels, time_steps = augmented_spec.shape
-    
-    # 1. Frequency Masking (横条遮挡)
-    for _ in range(num_mask):
-        f = random.randint(0, freq_masking)
-        f0 = random.randint(0, n_mels - f)
-        augmented_spec[:, f0:f0+f, :] = 0.0
-
-    # 2. Time Masking (竖条遮挡)
-    for _ in range(num_mask):
-        t = random.randint(0, time_masking)
-        t0 = random.randint(0, time_steps - t)
-        augmented_spec[:, :, t0:t0+t] = 0.0
-        
-    return augmented_spec
-
-def mixup_data(x, y, alpha=0.2, device='cuda'):
-    '''Returns mixed inputs, pairs of targets, and lambda'''
-    if alpha > 0:
-        lam = np.random.beta(alpha, alpha)
-    else:
-        lam = 1
-
-    batch_size = x.size(0)
-    index = torch.randperm(batch_size).to(device)
-
-    mixed_x = lam * x + (1 - lam) * x[index, :]
-    y_a, y_b = y, y[index]
-    return mixed_x, y_a, y_b, lam
-
-def mixup_criterion(criterion, pred, y_a, y_b, lam):
-    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
-
-
-class UrbanSoundDataset(Dataset):
-    def __init__(self, df, audio_dir, mode='train'):
-        self.df = df
-        self.audio_dir = audio_dir
-        self.mode = mode
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-        filename = row['slice_file_name']
-
-        # 1. 路径逻辑 (保持不变)
-        if self.mode == 'train':
-            file_path = self.audio_dir / f"fold{row['fold']}" / filename
-            label = row['classID']
-        else:
-            file_path = self.audio_dir / "test" / filename
-            label = -1 
-
-        try:
-            # 2. 加载音频 (保持不变)
-            y, _ = librosa.load(str(file_path), sr=CONFIG["SR"], duration=CONFIG["DURATION"])
-            target_len = int(CONFIG["SR"] * CONFIG["DURATION"])
-            if len(y) < target_len:
-                y = np.pad(y, (0, target_len - len(y)), mode='constant')
-            else:
-                y = y[:target_len]
-
-            # 3. 生成频谱 (保持不变)
-            mel_spec = librosa.feature.melspectrogram(
-                y=y, sr=CONFIG["SR"], n_mels=CONFIG["N_MELS"], 
-                fmax=8000, hop_length=512
-            )
-            mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
-
-            # 4. 尺寸对齐 (保持不变)
-            current_width = mel_spec_db.shape[1]
-            if current_width < CONFIG["MAX_LEN"]:
-                mel_spec_db = np.pad(mel_spec_db, ((0, 0), (0, CONFIG["MAX_LEN"] - current_width)), mode='constant')
-            else:
-                mel_spec_db = mel_spec_db[:, :CONFIG["MAX_LEN"]]
-
-            # 5. 归一化 (保持不变)
-            delta = mel_spec_db.max() - mel_spec_db.min() + 1e-8
-            image = (mel_spec_db - mel_spec_db.min()) / delta
-            image_tensor = torch.tensor(image, dtype=torch.float32).unsqueeze(0)
-
-            # --- [新增优化] SpecAugment ---
-            # 只有在训练模式下才做增强！验证集和测试集不要做！
-            if self.mode == 'train':
-                # 以 50% 的概率应用增强
-                if random.random() < 0.5:
-                    image_tensor = spec_augment(image_tensor)
-                return image_tensor, torch.tensor(label, dtype=torch.long)
-            else:
-                return image_tensor, row['id']
-
-        except Exception as e:
-            return torch.zeros((1, CONFIG["N_MELS"], CONFIG["MAX_LEN"])), 0
-
-# ==========================================
-# 3. 模型定义 (Model)
-# ==========================================
-class AudioCNN(nn.Module):
-    def __init__(self, num_classes=10):
-        super(AudioCNN, self).__init__()
-        
-        # 4层卷积块：提取特征
-        self.features = nn.Sequential(
-            # Block 1
-            nn.Conv2d(1, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.MaxPool2d(2), 
-            
-            # Block 2
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            
-            # Block 3
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-
-            # Block 4
-            nn.Conv2d(128, 256, kernel_size=3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((1, 1)) # 关键：无论前面尺寸如何，这里都压扁成 1x1
-        )
-        
-        # 分类器
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(256, 128),
-            nn.ReLU(),
-            nn.Dropout(0.5), # 防止过拟合
-            nn.Linear(128, num_classes)
-        )
-
-    def forward(self, x):
-        x = self.features(x)
-        x = self.classifier(x)
-        return x
-
-# ==========================================
-# 4. K-Fold 训练核心逻辑 (Updated)
-# ==========================================
-def run_k_fold_training():
+def train_model(csv_path, prefix="", res=128):
     seed_everything(CONFIG["SEED"])
+    full_df = pd.read_csv(csv_path)
     
-    # 读取全部元数据
-    full_df = pd.read_csv(TRAIN_CSV)
+    model_type = "CRNN"
+    model_key = f"{model_type}_{res}{prefix}"
     
-    # 官方数据一共分了 8 个 Fold (1, 2, ..., 8)
-    total_folds = 8 
+    print(f"\n{'='*50}")
+    print(f"🚀 Processing: {model_key} (Res: {res})")
+    print(f"{'='*50}")
     
-    # 用于存储每个 Fold 的最佳验证分数
-    fold_scores = []
+    scores = []
 
-    print(f"Starting {total_folds}-Fold Cross Validation...")
+    for fold_id in range(1, 9):
+        # 目标保存路径（Working 目录）
+        save_name = SAVE_DIR / f"{model_key}_fold_{fold_id}.pth"
+        
+        # 潜在的输入源路径 (Input 目录)
+        # 这里假设文件名完全一致
+        external_source = EXTERNAL_WEIGHTS_DIR / save_name.name
+        
+        # ✅ 如果 Working 里没有，但 Input 里有，先拷贝过来！
+        if (not save_name.exists()) and external_source.exists():
+            print(f"    📦 Found pretrained weight in Input: {external_source.name}")
+            try:
+                shutil.copy(external_source, save_name)
+                print(f"    ✅ Copied to working dir. Training will be skipped.")
+            except Exception as e:
+                print(f"    ⚠️ Copy failed: {e}")
 
-    for fold_id in range(1, total_folds + 1):
-        print(f"\n" + "="*20 + f" Training Fold {fold_id} / {total_folds} " + "="*20)
-        
-        # --- [关键修改] 动态划分数据集 ---
-        # 验证集：当前的 fold_id
-        # 训练集：除了当前 fold_id 以外的所有数据
-        # 注意：严格遵守官方规则，不要打乱重排 (No Reshuffling) 
-        val_df = full_df[full_df['fold'] == fold_id].reset_index(drop=True)
-        train_df = full_df[full_df['fold'] != fold_id].reset_index(drop=True)
+        # 下面的逻辑保持不变，因为现在 save_name 已经存在了（如果拷贝成功的话）
+        run_inference = False
+        needs_training = True
 
-        print(f"Train set: {len(train_df)} | Val set: {len(val_df)}")
+        if save_name.exists():
+            print(f"    ⏩ Fold {fold_id}: Found existing .pth. Checking...", end="\r")
+            run_inference = True
+            needs_training = False 
         
-        # 创建 DataLoader
-        # Windows 用户建议 num_workers=0, Linux/Mac 可设为 2 或 4
-        num_workers = 0 if os.name == 'nt' else 2
-        
-        train_loader = DataLoader(UrbanSoundDataset(train_df, AUDIO_DIR, 'train'), 
-                                  batch_size=CONFIG["BATCH_SIZE"], shuffle=True, num_workers=num_workers)
-        val_loader = DataLoader(UrbanSoundDataset(val_df, AUDIO_DIR, 'train'), 
-                                batch_size=CONFIG["BATCH_SIZE"], shuffle=False, num_workers=num_workers)
+        model = AdvancedCRNN(input_mels=res).to(CONFIG["DEVICE"])
 
-        # 初始化一个全新的模型 (每个 Fold 都要重新初始化，不能继承之前的权重) 
-        model = AudioCNN(num_classes=10).to(CONFIG["DEVICE"])
-        
-        criterion = nn.CrossEntropyLoss()
-        optimizer = optim.Adam(model.parameters(), lr=CONFIG["LR"])
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3)
+        if run_inference:
+            try:
+                state_dict = torch.load(save_name, map_location=CONFIG["DEVICE"])
+                new_state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+                model.load_state_dict(new_state_dict)
+            except:
+                print(f"\n    ⚠️ Fold {fold_id}: File corrupt. Retraining...")
+                needs_training = True
+                run_inference = False
 
-        best_fold_score = 0.0
-        
-        # 训练 Epochs
-        for epoch in range(CONFIG["EPOCHS"]):
-            model.train()
-            train_loss = 0
+        if needs_training:
+            print(f"    🔥 Fold {fold_id}: Training start...")
+            train_df = full_df[full_df['fold'] != fold_id].reset_index(drop=True)
+            val_df = full_df[full_df['fold'] == fold_id].reset_index(drop=True)
             
-            for images, labels in tqdm(train_loader, desc=f"Fold {fold_id} Ep {epoch+1}", leave=False):
-                images, labels = images.to(CONFIG["DEVICE"]), labels.to(CONFIG["DEVICE"])
+            train_ds = UrbanSoundDataset(train_df, NPY_DIR, 'train', res, cache_data=True)
+            train_loader = DataLoader(train_ds, batch_size=CONFIG["BATCH_SIZE"], shuffle=True, num_workers=CONFIG["NUM_WORKERS"], pin_memory=True, persistent_workers=True)
+            val_loader = DataLoader(UrbanSoundDataset(val_df, NPY_DIR, 'train', res, cache_data=True), batch_size=CONFIG["BATCH_SIZE"]*2, shuffle=False, num_workers=CONFIG["NUM_WORKERS"], pin_memory=True)
+
+            try: model = torch.compile(model) 
+            except: pass
+
+            scaler = torch.amp.GradScaler('cuda')
+            criterion = FocalLoss(gamma=2.0, label_smoothing=0.05)
+            optimizer = optim.AdamW(model.parameters(), lr=CONFIG["LR"], weight_decay=5e-2)
+            scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-6)
+
+            best_acc = 0.0
+            no_imp = 0
+            
+            for epoch in range(CONFIG["EPOCHS"]):
+                model.train()
+                pbar = tqdm(train_loader, desc=f"Fold {fold_id} Ep {epoch+1}", leave=False)
+                for imgs, lbls in pbar:
+                    imgs, lbls = imgs.to(CONFIG["DEVICE"]), lbls.to(CONFIG["DEVICE"])
+                    imgs = Augmenter.add_noise(imgs)
+                    imgs = Augmenter.spec_augment(imgs)
+                    optimizer.zero_grad()
+                    with torch.amp.autocast('cuda'):
+                        imgs, la, lb, lam = Augmenter.get_batch(imgs, lbls)
+                        out = model(imgs)
+                        loss = lam * criterion(out, la) + (1-lam) * criterion(out, lb)
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                    scheduler.step()
+                    pbar.set_postfix({'loss': f"{loss.item():.4f}"})
+
+                if (epoch < 10) or (epoch % 2 != 0 and epoch < 35): continue
+
+                model.eval()
+                preds, targs = [], []
+                with torch.no_grad():
+                    for imgs, lbls in val_loader:
+                        imgs = imgs.to(CONFIG["DEVICE"])
+                        with torch.amp.autocast('cuda'):
+                            out = model(imgs)
+                        preds.extend(out.argmax(1).cpu().numpy())
+                        targs.extend(lbls.numpy())
                 
-                optimizer.zero_grad()
-                # --- [新增优化] Mixup ---
-                # 50% 的概率使用 Mixup，或者全程使用
-                use_mixup = True # 建议全程开启或设置概率
-                
-                if use_mixup:
-                    mixed_images, labels_a, labels_b, lam = mixup_data(images, labels, alpha=0.2, device=CONFIG["DEVICE"])
-                    outputs = model(mixed_images)
-                    loss = mixup_criterion(criterion, outputs, labels_a, labels_b, lam)
+                acc = accuracy_score(targs, preds)
+                if acc > best_acc:
+                    best_acc = acc
+                    torch.save(model.state_dict(), save_name)
+                    no_imp = 0
                 else:
-                    outputs = model(images)
-                    loss = criterion(outputs, labels)
-                
-                loss.backward()
-                optimizer.step()
-                train_loss += loss.item()
-
-            # 验证 (Validation)
-            model.eval()
-            val_preds, val_labels = [], []
-            with torch.no_grad():
-                for images, labels in val_loader:
-                    images, labels = images.to(CONFIG["DEVICE"]), labels.to(CONFIG["DEVICE"])
-                    outputs = model(images)
-                    _, predicted = torch.max(outputs, 1)
-                    val_preds.extend(predicted.cpu().numpy())
-                    val_labels.extend(labels.cpu().numpy())
-
-            # 计算分数
-            acc = accuracy_score(val_labels, val_preds)
-            f1 = f1_score(val_labels, val_preds, average='macro')
-            weighted_score = 0.8 * acc + 0.2 * f1 # [cite: 38, 39]
-
-            scheduler.step(weighted_score)
-
-            # 保存当前 Fold 的最佳模型
-            # 注意文件名加上 fold_id
-            if weighted_score > best_fold_score:
-                best_fold_score = weighted_score
-                torch.save(model.state_dict(), f"best_model_fold_{fold_id}.pth")
-        
-        print(f"Fold {fold_id} Best Score: {best_fold_score:.4f}")
-        fold_scores.append(best_fold_score)
-
-    print("\n" + "="*40)
-    print("Training Complete!")
-    print(f"Average Score across 8 folds: {np.mean(fold_scores):.4f}")
-    print("Individual Scores:", [f"{s:.4f}" for s in fold_scores])
-
-# ==========================================
-# 5. 集成推理与提交 (Ensemble Inference)
-# ==========================================
-def generate_ensemble_submission():
-    print("\nStarting Ensemble Inference (Soft Voting)...")
-    
-    test_df = pd.read_csv(TEST_CSV)
-    test_loader = DataLoader(
-        UrbanSoundDataset(test_df, AUDIO_DIR, mode='test'),
-        batch_size=CONFIG["BATCH_SIZE"], shuffle=False, num_workers=0
-    )
-
-    # 准备一个容器来存储所有模型的预测概率
-    # 形状: (测试集数量, 10个类别)
-    avg_probs = torch.zeros((len(test_df), 10)).to(CONFIG["DEVICE"])
-    
-    # 遍历所有 8 个训练好的模型
-    total_folds = 8
-    models_loaded = 0
-    
-    for fold_id in range(1, total_folds + 1):
-        model_path = f"best_model_fold_{fold_id}.pth"
-        if not os.path.exists(model_path):
-            print(f"Warning: {model_path} not found, skipping...")
-            continue
+                    no_imp += 1
+                if no_imp >= CONFIG["PATIENCE"]: break
             
-        print(f"Loading {model_path}...")
-        model = AudioCNN(num_classes=10).to(CONFIG["DEVICE"])
-        model.load_state_dict(torch.load(model_path))
+            state_dict = torch.load(save_name, map_location=CONFIG["DEVICE"])
+            new_state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+            try: model.load_state_dict(new_state_dict)
+            except: model.load_state_dict(state_dict)
+
+        if not needs_training:
+            val_df = full_df[full_df['fold'] == fold_id].reset_index(drop=True)
+            val_loader = DataLoader(UrbanSoundDataset(val_df, NPY_DIR, 'train', res, cache_data=True), batch_size=CONFIG["BATCH_SIZE"]*2, shuffle=False, num_workers=CONFIG["NUM_WORKERS"], pin_memory=True)
+
         model.eval()
-        
-        fold_probs = []
-        
+        preds, targs = [], []
         with torch.no_grad():
-            for images, ids in tqdm(test_loader, desc=f"Predicting Fold {fold_id}"):
-                images = images.to(CONFIG["DEVICE"])
-                outputs = model(images)
-                # 关键：使用 Softmax 获取概率，而不是直接取 max
-                probs = torch.softmax(outputs, dim=1) 
-                fold_probs.append(probs)
+            for imgs, lbls in tqdm(val_loader, desc=f"Eval F{fold_id}", leave=False):
+                imgs = imgs.to(CONFIG["DEVICE"])
+                with torch.amp.autocast('cuda'):
+                    out = model(imgs)
+                preds.extend(out.argmax(1).cpu().numpy())
+                targs.extend(lbls.numpy())
         
-        # 将当前 Fold 的预测概率加到总和中
-        avg_probs += torch.cat(fold_probs, dim=0)
-        models_loaded += 1
-
-    # 取平均 (其实不除也行，因为 max 不受缩放影响，但为了严谨)
-    avg_probs /= models_loaded
-    
-    # 最终决策：选概率最大的类别
-    final_predictions = torch.argmax(avg_probs, dim=1).cpu().numpy()
-    
-    # 生成提交文件
-    # 注意：需要重新映射 ID，因为 DataLoader 可能乱序（虽然 shuffle=False，但为了保险）
-    # 在这个 Dataset 实现中，我们直接按顺序返回了 ID，所以顺序是对齐的。
-    # 但最稳妥的方式是把 ID 也存下来。
-    # 这里我们简化处理，假设顺序一致。
-    
-    # 更好的方式是重新从 test_loader 拿一次 ID（避免变量作用域问题）
-    all_ids = []
-    for _, ids in test_loader:
-        all_ids.extend(ids)
+        fold_acc = accuracy_score(targs, preds)
+        scores.append(fold_acc)
+        print(f"    🏆 [Fold {fold_id}] Accuracy: {fold_acc:.4f}")
         
-    results = []
-    for id_val, pred_val in zip(all_ids, final_predictions):
-        results.append({'id': id_val, 'label': pred_val})
+        del model; gc.collect(); torch.cuda.empty_cache()
 
-    sub_df = pd.DataFrame(results)
-    sub_df.to_csv("submission_ensemble_8folds.csv", index=False)
-    print(f"✓ Ensemble Submission saved! Used {models_loaded} models.")
+    avg_score = np.mean(scores)
+    print(f"📊 {model_key} Summary: Avg={avg_score:.4f}")
+    return avg_score
 
+# ==========================================
+# 6. 推理函数 
+# ==========================================
+def predict_with_tta(model, imgs):
+    outputs = []
+    
+    with torch.amp.autocast('cuda'):
+        base_out = torch.softmax(model(imgs), dim=1)
+        outputs.append((base_out, 1.5))
+    
+    for shift in CONFIG["TTA_SHIFTS"]:
+        if shift == 0: continue
+        aug = torch.roll(imgs, shifts=shift, dims=3)
+        with torch.amp.autocast('cuda'):
+            outputs.append((torch.softmax(model(aug), dim=1), 1.1))
+            
+    for shift in [-2, 2]:
+        aug = torch.roll(imgs, shifts=shift, dims=2)
+        with torch.amp.autocast('cuda'):
+            outputs.append((torch.softmax(model(aug), dim=1), 0.9))
+    
+    for gain in [0.9, 1.1]:
+        aug = imgs * gain
+        with torch.amp.autocast('cuda'):
+             outputs.append((torch.softmax(model(aug), dim=1), 1.0))
+
+    final_prob = 0
+    total_weight = 0
+    for prob, w in outputs:
+        final_prob += prob * w
+        total_weight += w
+        
+    return final_prob / total_weight
+
+def inference(prefix="", res=128):
+    print(f"\n🔮 Inference [{prefix}] Res:{res}...")
+    test_df = pd.read_csv(TEST_CSV_PATH)
+    final_probs = torch.zeros((len(test_df), 10), device=CONFIG["DEVICE"])
+    cnt = 0
+    
+    model_key = f"CRNN_{res}{prefix}"
+    ds = UrbanSoundDataset(test_df, NPY_DIR, 'test', res, cache_data=True)
+    loader = DataLoader(ds, batch_size=CONFIG["BATCH_SIZE"]*2, shuffle=False, num_workers=2)
+
+    for fold in range(1, 9):
+        path = SAVE_DIR / f"{model_key}_fold_{fold}.pth"
+        if not path.exists(): continue
+        
+        model = AdvancedCRNN(input_mels=res).to(CONFIG["DEVICE"])
+        try:
+            state_dict = torch.load(path, map_location=CONFIG["DEVICE"])
+            new_state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+            model.load_state_dict(new_state_dict)
+        except: continue
+        model.eval()
+
+        fold_probs = []
+        with torch.no_grad():
+            for imgs, _, _ in tqdm(loader, desc=f"F{fold}", leave=False):
+                imgs = imgs.to(CONFIG["DEVICE"])
+                fold_probs.append(predict_with_tta(model, imgs))
+        
+        final_probs += torch.cat(fold_probs)
+        cnt += 1
+        del model; gc.collect()
+
+    if cnt > 0: final_probs /= cnt
+    return final_probs.cpu()
+
+
+# ==========================================
+# 7. 主流程执行
+# ==========================================
 if __name__ == "__main__":
-    # 1. 跑满 8 个 Fold 的训练
-    run_k_fold_training()
+    print("\n" + "="*60)
+    print("🚀 STARTING DENSE MULTI-RESOLUTION ENSEMBLE")
+    print("   Logic: Check INPUT dir first. If exists -> Copy & Skip Train.")
+    print("="*60)
+
+    # 1. 设置 5 路分辨率
+    CONFIG["FINAL_RESOLUTIONS"] = [128, 160, 192, 256, 320]
     
-    # 2. 集合 8 个模型的力量生成结果
-    generate_ensemble_submission()
+    # 2. 初始化
+    final_ensemble_probs = 0
+    
+    # 3. 定义权重 (密集集成策略)
+    res_weights = {
+        128: 0.6,   # 降权：它主要用来防止过拟合，但准确度不如大图
+        160: 0.9,   # 微降
+        192: 1.3,   # ⭐️ 核心主力1
+        256: 1.5,   # ⭐️ 核心主力2 (通常表现最好)
+        320: 1.2    # 保持高位
+    }
+    total_weight = sum(res_weights.values())
+
+    for res in CONFIG["FINAL_RESOLUTIONS"]:
+        # --- 显存保护机制 ---
+        current_bs = 64
+        if res >= 320: current_bs = 48
+        elif res >= 256: current_bs = 56
+        CONFIG["BATCH_SIZE"] = current_bs
+        
+        print(f"\n⚡ Resolution: {res} | Batch Size: {current_bs}")
+
+        # A. 训练 (如果文件在 Input 里有，会自动拷贝并跳过)
+        # 注意：这里 prefix 保持为 "_final_pseudo"，确保文件名匹配
+        train_model(TRAIN_CSV_PATH, prefix="_final_pseudo", res=res)
+        
+        # B. 推理
+        preds = inference(prefix="_final_pseudo", res=res)
+        
+        # C. 加权集成
+        w = res_weights.get(res, 1.0)
+        print(f"    ⚖️ Merging Resolution {res} with weight {w}")
+        final_ensemble_probs += (preds.to(CONFIG["DEVICE"]) * w)
+
+    # 归一化
+    final_ensemble_probs /= total_weight
+    # 🔥【新增】Power Sharpening (锐化)
+    # 系数 1.05 - 1.10 比较安全。太大会导致甚至错判也被放大。
+    print("🔪 Applying Power Sharpening (Power=1.05)...")
+    final_ensemble_probs = final_ensemble_probs ** 1.05
+    # 重新归一化一下（虽然argmax不需要，但为了后续乘权重数学上严谨）
+    final_ensemble_probs = final_ensemble_probs / final_ensemble_probs.sum(dim=1, keepdim=True)
+    # 先应用基础权重
+    # 针对常见混淆的强力修正权重
+    # 1. 基础权重微调 (V5 - 基于 0.8826 报告的修正)
+    # 逻辑：Music 继续压，AirCon 继续抬，Children 稍微压一点(因为Recall很高但Precision一般)
+    class_weights = torch.tensor([1.85, 1.00, 0.85, 0.95, 1.25, 1.10, 1.00, 0.65, 1.35, 0.55]).to(CONFIG['DEVICE'])
+    
+    # ⚠️ 注意：此处原代码使用了 base_weights，但定义的是 class_weights。
+    # 为了保持不修改代码逻辑的原则，保留原样。如果报错，请检查变量名。
+    probs = final_ensemble_probs * class_weights
+    
+    # 2. 🔥 【核心大招】特定混淆修正 (The Tie-Breaker)
+    # 这是一个硬逻辑：如果模型在 A 和 B 之间犹豫，且分差很小，强制判给“弱势群体”。
+    
+    # ---------------------------------------------------------
+    # 修正 A: Engine (5) vs Air_conditioner (0)
+    # ---------------------------------------------------------
+    conflict_mask_5_0 = (torch.argmax(probs, dim=1) == 5)
+    
+    # ⬆️ 回调：从 0.50 提回 0.60。
+    condition_5_0 = probs[:, 0] > (probs[:, 5] * 0.60) 
+    
+    # ⬇️ 降力度：从 2.0 降回 1.5。
+    probs[conflict_mask_5_0 & condition_5_0, 0] *= 1.5 
+    
+    # ---------------------------------------------------------
+    # 修正 B: Street_music (9) vs Others
+    # ---------------------------------------------------------
+    conflict_mask_9 = (torch.argmax(probs, dim=1) == 9) 
+    
+    # B1: Music vs Children
+    condition_9_2 = probs[:, 2] > (probs[:, 9] * 0.70)
+    probs[conflict_mask_9 & condition_9_2, 2] *= 1.5
+
+    # B2: Music vs Dog
+    condition_9_3 = probs[:, 3] > (probs[:, 9] * 0.70)
+    probs[conflict_mask_9 & condition_9_3, 3] *= 1.5
+    
+    # ---------------------------------------------------------
+    # 修正 C: Jackhammer (7) vs Drilling (4)
+    # ---------------------------------------------------------
+    conflict_mask_7_4 = (torch.argmax(probs, dim=1) == 7) 
+    condition_7_4 = probs[:, 4] > (probs[:, 7] * 0.75)
+    probs[conflict_mask_7_4 & condition_7_4, 4] *= 1.4
+    
+    final_ensemble_probs = probs
+
+    # -------------------------------------
+    # Step 3: 生成提交
+    # -------------------------------------
+    print("💾 Saving Submission...")
+    final_preds = torch.argmax(final_ensemble_probs, dim=1).cpu().numpy()
+    
+    test_df = pd.read_csv(TEST_CSV_PATH)
+    sub = pd.DataFrame({'ID': range(len(test_df)), 'TARGET': final_preds})
+    sub.to_csv("submission.csv", index=False)
+    
+    print("\n✅ DONE! Dense Ensemble Submission Generated.")
